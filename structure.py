@@ -1,79 +1,85 @@
+import argparse
+import csv
+import json
 import os
-from typing import List
 
-import typer
+from dotenv import load_dotenv
 from griptape.artifacts import ListArtifact, TextArtifact
 from griptape.drivers import GriptapeCloudEventListenerDriver
-from griptape.events import (
-    EventBus,
-    EventListener,
-    FinishStructureRunEvent,
-    StartActionsSubtaskEvent,
-)
+from griptape.events import EventBus, EventListener, FinishStructureRunEvent
+from griptape.loaders import CsvLoader
+from griptape.rules import Rule
 from griptape.structures import Agent
+from griptape.tasks import PromptTask
 
 
-def setup_cloud_listener():
-    # Are we running in a managed environment?
-    if "GT_CLOUD_STRUCTURE_RUN_ID" in os.environ:
-        # If so, the runtime takes care of loading the .env file
-        EventBus.add_event_listener(
-            EventListener(
-                event_listener_driver=GriptapeCloudEventListenerDriver(),
+def is_running_in_managed_environment() -> bool:
+    return "GT_CLOUD_STRUCTURE_RUN_ID" in os.environ
+
+
+def filter_spreadsheet(input_file, filter_by) -> list:
+    with open(input_file, "r") as file:
+        first_line = file.readline().strip()
+        headers = first_line.split(",")
+
+    agent = Agent(
+        tasks=[
+            PromptTask(
+                input=f"Return the column names related to {filter_by} in the following data: {headers}",
+                rules=[Rule("Output a json list of strings")],
             )
-        )
-    else:
-        EventBus.add_event_listener(
-            EventListener(
-                event_types=[StartActionsSubtaskEvent],
-            )
-        )
-        # If not, we need to load the .env file ourselves
-        from dotenv import load_dotenv
+        ],
+        rules=[
+            Rule("Output JUST the data with NO commentary"),
+        ],
+    )
 
-        load_dotenv()
+    agent.run()
+    output_json = agent.output.to_text()
+    column_names = json.loads(output_json)
 
+    with open(input_file, "r") as file:
+        reader = csv.DictReader(file)
+        extracted_data = [
+            {col: row[col] for col in column_names if col in row} for row in reader
+        ]
 
-app = typer.Typer(add_completion=False)
-
-
-@app.command()
-def run(args: List[str] = typer.Argument(...)):
-    """Run the agent with a prompt."""
-
-    # If you want to run a Griptape Structure, set this to True
-    # otherwise, if you're just running regular Python code, set it to False
-    use_structure = False
-
-    if use_structure:
-        # Setup the cloud listener before Griptape Structure
-        setup_cloud_listener()
-
-        # Run the Griptape Structure
-        agent = Agent()
-        agent.run(args)
-    else:
-        # Run whatever code you want and make sure to save the output(s) as a TextArtifact(s)
-        output_artifact_msg = TextArtifact("Hello from a Griptape Cloud Structure.")
-        output_artifact_prompt = TextArtifact(args)
-
-        # Create Input and Output Artifacts
-        task_input = TextArtifact(value=None)
-        task_output = ListArtifact([output_artifact_msg, output_artifact_prompt])
-        print(task_output)
-
-        # Setup the cloud listener after your code, and before
-        # publishing the FinishStructureRunEvent
-        setup_cloud_listener()
-
-        # Create the FinishStructureRunEvent
-        done_event = FinishStructureRunEvent(
-            output_task_input=task_input, output_task_output=task_output
-        )
-
-        # Publish the FinishStructureRunEvent
-        EventBus.publish_event(done_event, flush=True)
+    return extracted_data
 
 
 if __name__ == "__main__":
-    app()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_artifacts")  # positional
+    parser.add_argument(
+        "-d",
+        "--data_to_parse",
+        required=True,
+        help="the prompt data to parse out of the CSV",
+    )
+
+    args = parser.parse_args()
+    input_data = args.input_artifacts
+    filter_by = args.data_to_parse
+
+    load_dotenv()
+
+    output_file_path_local = "./temp_file.csv"
+    os.makedirs(os.path.dirname(output_file_path_local), exist_ok=True)
+    CsvLoader().save(output_file_path_local, input_data)
+
+    extracted_data = filter_spreadsheet(output_file_path_local, filter_by)
+
+    print(extracted_data)
+
+    if is_running_in_managed_environment():
+        artifacts = ListArtifact(extracted_data)
+
+        task_input = TextArtifact(value=None)
+        done_event = FinishStructureRunEvent(
+            output_task_input=task_input, output_task_output=artifacts
+        )
+        EventBus.add_event_listener(
+            EventListener(event_listener_driver=GriptapeCloudEventListenerDriver())
+        )
+        EventBus.publish_event(done_event, flush=True)
+        print("Published final event")
